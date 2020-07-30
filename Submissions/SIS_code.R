@@ -1,9 +1,16 @@
 remove(list = ls())
 library(tidyverse)
-library(ggrepel)
 library(lme4)
 library(modeest)
+library(ordinal)
+library(ggrepel)
+library(ggnewscale)
 df <- read.csv("~/Downloads/AnalyticsChallenge2020-master/Data/AnalyticsChallenge2020Data.csv", stringsAsFactors=FALSE)
+team_colors <- read.csv(url('https://raw.githubusercontent.com/leesharpe/nfldata/master/data/teamcolors.csv'))
+team_colors$color <- ifelse(team_colors$color=='#000000', as.character(team_colors$color2), as.character(team_colors$color))
+team_colors$color <- ifelse(team_colors$team %in% c('DEN', 'LV'), as.character(team_colors$color2), as.character(team_colors$color))
+
+
 df$EPA <- as.numeric(df$EPA)
 df$PressureOnPlay <- as.numeric(df$PressureOnPlay)
 df$SackOnPlay <- as.numeric(df$SackOnPlay)
@@ -22,6 +29,10 @@ df$tackles <- df$SoloTackle + .5*df$AssistedTackle
 
 # Get run gap
 df$RunGap <- str_sub(df$RunDirection,-5, -5)
+
+# Binary variable for if the run was toward the defender's side
+df$RunSide <- ifelse(substr(df$RunDirection,1, 1)!=substr(df$SideOfBall, 1 , 1) | df$SideOfBall == 'NULL' ,1, 0)
+
 
 # Keep only front seven players
 df <-
@@ -159,6 +170,8 @@ team_names <-
   select(DefensiveTeam, defteam)
 
 team_names[nrow(team_names) + 1,] = c("Rams","LA")
+team_names$DefensiveTeam <- gsub('LV', 'OAK', team_names$DefensiveTeam)
+
 
 df <- left_join(df, team_names, by = 'DefensiveTeam') %>%
   left_join(team_names , by = c('OffensiveTeam' = 'DefensiveTeam')) 
@@ -309,8 +322,6 @@ mixed_model <- glmer(Pressure ~ as.factor(Down) + ToGo + TechniqueName + (1|Name
                     data = df %>% filter(EventType == 'pass', IsRushing == 1, !is.na(cluster)),
                     family=binomial)
 
-intercepts <-data.frame(ranef(mixed_model))
-
 player_pressures <-
   df %>% filter(EventType == 'pass', IsRushing == 1, !is.na(cluster)) %>%
   mutate(n=1) %>%
@@ -320,18 +331,22 @@ player_pressures <-
             DefensiveTeam = mlv(DefensiveTeam, method='mfv')) %>%
   filter(n_snaps > 25)
 
+intercepts <-data.frame(lme4::ranef(mixed_model))
+
 intercepts <-
   inner_join(intercepts, player_pressures %>% select(Name, DefensiveTeam, cluster, player_z), by = c('grp' = 'Name')) %>%
-  arrange(-condval)
+  arrange(-condval) %>% left_join(team_colors, by = c('DefensiveTeam' = 'team'))
 
-intercepts$grp <- factor(reorder(intercepts$grp, -intercepts$condval))
+intercepts$condval <- exp(mixed_model@beta[1] + intercepts$condval)/(1+exp(mixed_model@beta[1] + intercepts$condval)) - (exp(mixed_model@beta[1])/(1+exp(mixed_model@beta[1])))
+
+intercepts$cluster <- factor(intercepts$cluster, levels = c('Edge', 'Tackle', 'Nose'))
 
 mu <- intercepts %>% group_by(cluster) %>% summarise(avg_value = mean(condval))
 ggplot(intercepts, aes(x = condval, fill = cluster)) +
   geom_density(alpha = 0.5) +
   geom_vline(data = mu, aes(xintercept=avg_value, color = cluster)) +
-  ggtitle("Mixed Effects Player Intercepts") +
-  xlab("Logit Player Intercept") +
+  ggtitle("Player Intercept Results") +
+  xlab("Pressure Rate Over Expectation") +
   theme(text = element_text(size=rel(3.7)), plot.title = element_text(size = 16, face = "bold"),
         axis.text=element_text(size=12), 
         legend.title=element_text(size=13), 
@@ -344,22 +359,37 @@ edge_cor <- round(cor(edge_intercepts$condval, edge_intercepts$player_z), 3)
 tackle_cor <-round(cor(tackle_intercepts$condval, tackle_intercepts$player_z), 3)
 nose_cor <- round(cor(nose_intercepts$condval, nose_intercepts$player_z), 3)
 
+intercepts$name <- ifelse(intercepts$condval > .02, paste(paste0(substring(intercepts$grp, 1, 1), '.'), paste0(sub(".*? ", "", intercepts$grp), ','), intercepts$DefensiveTeam), '')
+intercepts$name <- ifelse(intercepts$grp %in% c('Kenny Clark', 'Javon Hargrave', 'Armon Watts', 'Vita Vea', 'Mike Pennel'),  paste(paste0(substring(intercepts$grp, 1, 1), '.'), paste0(sub(".*? ", "", intercepts$grp), ','), intercepts$DefensiveTeam), intercepts$name)
+intercepts$team_color <- ifelse(nchar(intercepts$name) > 1 , intercepts$color, '#000000')
+intercepts$team_color2 <- ifelse(intercepts$DefensiveTeam=='PIT', '#000000', intercepts$team_color)
+
+intercepts <- intercepts %>% arrange(desc(name))
+
+intercepts$name <- factor(intercepts$name,levels=unique(intercepts$name))
+
 intercepts %>%
-  ggplot(aes(x = player_z, y = condval)) +
-  geom_point() +
-  xlim(-1.24, 3.82) + ylim(-.36, .52) +
+  ggplot(aes(x = player_z, y = condval, label = name)) +
+  scale_color_manual(values = intercepts$team_color2) +
+  geom_label_repel(aes(color = name), arrow = arrow(length = unit(0.02, "npc")),
+                   box.padding = .6, point.padding = .05, size = 3.28, direction = 'both', min.segment.length = .2, max.iter = 14000) +
+  new_scale_color() +
+  scale_color_manual(values = intercepts$team_color) +
+  geom_point(aes(color = name)) +
+  xlim(-1.24, 3.82) + ylim(-.0152, .0332) +
   facet_wrap(~cluster, labeller = labeller(cluster = 
                                              c("Edge" = paste('Edge: Cor =', edge_cor),
                                                "Tackle" = paste('Tackle: Cor =', tackle_cor),
                                                "Nose" = paste('Nose: Cor =', nose_cor)))) +
   geom_smooth(method='lm', formula= y~x, color='blue') +
-  ylab('Player Intercept') +
+  ylab('Pressure Rate Over Expectation') +
   xlab('Standardized Draft/FA Value') +
   theme(text = element_text(size=rel(3.5)), plot.title = element_text(size = 28, face = "bold"),
         axis.text=element_text(size=10.5),
-        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"))
+        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"),
+        legend.position = 'none')
 
-ggsave("intercepts.png", width = 8.25, height = 4.6)
+ggsave("intercepts.png", width = 9.2, height = 4.6)
 
 
 neg_epa_tackles <-
@@ -394,13 +424,22 @@ neg_epa_tackles <-
   filter(n_snaps > 40) 
 
 df$tackles_neg <- ifelse(df$EPA < 0, df$tackles, 0)
-mixed_model2 <- lmer(tackles_neg ~ as.factor(Down) + ToGo + TechniqueName + (1|Name),
-                     data = df %>% filter(!is.na(cluster), EventType == 'rush'))
+#mixed_model2 <- lmer(tackles_neg ~ as.factor(Down) + ToGo + TechniqueName + (1|Name),
+#                     data = df %>% filter(!is.na(cluster), EventType == 'rush'))
 
-intercepts2 <-data.frame(ranef(mixed_model2))
+mixed_model2 <- clmm(factor(tackles_neg) ~ as.factor(Down) + ToGo + RunSide + TechniqueName + (1|Name),
+                     data = df %>% filter(!is.na(cluster), EventType == 'rush', RunGap != 'i'))
+
+intercepts2 <-data.frame(ordinal::ranef(mixed_model2))
+intercepts2 <- cbind(rownames(intercepts2), intercepts2, row.names=NULL)
+colnames(intercepts2) <- c("grp","condval")
+intercepts2$condval <- (exp(mixed_model2[["coefficients"]][2] + intercepts2$condval)/(1+exp(mixed_model2[["coefficients"]][2] + intercepts2$condval)) - (exp(mixed_model2[["coefficients"]][2])/(1+exp(mixed_model2[["coefficients"]][2])))) +
+  (.5 * (exp(mixed_model2[["coefficients"]][2] + intercepts2$condval)/(1+exp(mixed_model2[["coefficients"]][2] + intercepts2$condval)) - (exp(mixed_model2[["coefficients"]][2])/(1+exp(mixed_model2[["coefficients"]][2])))))
 intercepts2 <-
-  inner_join(intercepts2, neg_epa_tackles %>% select(Name, cluster, player_z), by = c('grp' = 'Name')) %>%
-  arrange(-condval)
+  inner_join(intercepts2, neg_epa_tackles %>% select(Name, cluster, player_z, DefensiveTeam), by = c('grp' = 'Name')) %>%
+  arrange(-condval) %>% left_join(team_colors, by = c('DefensiveTeam' = 'team'))
+intercepts2$cluster <- factor(intercepts2$cluster, levels = c('Edge', 'Tackle', 'Nose'))
+
 
 mu <- intercepts2 %>% group_by(cluster) %>% summarise(avg_value = mean(condval))
 ggplot(intercepts2, aes(x = condval, fill = cluster)) +
@@ -420,37 +459,46 @@ edge_cor <- round(cor(edge_intercepts$condval, edge_intercepts$player_z), 3)
 tackle_cor <-round(cor(tackle_intercepts$condval, tackle_intercepts$player_z), 3)
 nose_cor <- round(cor(nose_intercepts$condval, nose_intercepts$player_z), 3)
 
-intercepts2$cluster <- factor(intercepts2$cluster, levels = c('Edge', 'Tackle', 'Nose'))
+intercepts2$name <- ifelse(intercepts2$condval > .009, paste(paste0(substring(intercepts2$grp, 1, 1), '.'), paste0(sub(".*? ", "", intercepts2$grp), ','), intercepts2$DefensiveTeam), '')
+intercepts2$name <- ifelse(intercepts2$grp == 'Antwaun Woods', '', intercepts2$name)
+intercepts2$team_color <- ifelse(nchar(intercepts2$name) > 1 , intercepts2$color, '#000000')
+intercepts2$team_color2 <- ifelse(intercepts2$DefensiveTeam=='PIT', '#000000', intercepts2$team_color)
+intercepts2$name <- factor(intercepts2$name,levels=unique(intercepts2$name))
+
+
 intercepts2 %>%
-  ggplot(aes(x = player_z, y = condval)) +
-  geom_point() +
-  xlim(-1.24, 3.82) + ylim(-.0175, .0191) +
+  ggplot(aes(x = player_z, y = condval, label = name)) +
+  scale_color_manual(values = intercepts2$team_color2) +
+  geom_label_repel(aes(color = name), arrow = arrow(length = unit(0.02, "npc")),
+                   box.padding = .7, point.padding = .05, size = 3.28, direction = 'both', min.segment.length = .2, max.iter = 14000) +
+  new_scale_color() +
+  scale_color_manual(values = intercepts2$team_color) +
+  geom_point(aes(color = name)) +
+  xlim(-1.24, 3.82) + ylim(-.0192, .019) +
   facet_wrap(~cluster, labeller = labeller(cluster = 
                                              c("Edge" = paste('Edge: Cor =', edge_cor),
                                                "Tackle" = paste('Tackle: Cor =', tackle_cor),
                                                "Nose" = paste('Nose: Cor =', nose_cor)))) +
   geom_smooth(method='lm', formula= y~x, color='blue') +
-  ylab('Player Intercept') +
+  ylab('Negative EPA Tackle Rate Over Expectation') +
   xlab('Standardized Draft/FA Value') +
   theme(text = element_text(size=rel(3.5)), plot.title = element_text(size = 28, face = "bold"),
         axis.text=element_text(size=10.5),
-        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"))
+        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"),
+        legend.position = 'none')
 
-ggsave("intercepts2.png", width = 8.25, height = 4.6)
+ggsave("intercepts2.png", width = 9.2, height = 4.6)
 
 
 designated_gap <-
   df %>% filter(EventType=='rush', RunGap != 'i') %>%
-  group_by(DefensiveTeam, Week, EventID, RunGap) %>%
-  summarise(EPA = mean(EPA), UsedDesignedGap = mean(as.numeric(UsedDesignedGap))) %>%
+  group_by(DefensiveTeam, Week, EventID, success) %>%
+  summarise(EPA = mean(success), UsedDesignedGap = mean(as.numeric(UsedDesignedGap))) %>%
   mutate(n=1) %>%
-  group_by(RunGap, UsedDesignedGap) %>%
+  group_by(UsedDesignedGap) %>%
   summarise(
-            EPA = mean(EPA),
+            EPA = mean(success),
             n_snaps = sum(n)) 
-
-  # Binary variable for if the run was toward the defender's side
-df$RunSide <- ifelse(substr(df$RunDirection,1, 1)!=substr(df$SideOfBall, 1 , 1) | df$SideOfBall == 'NULL' ,1, 0)
 
 player_designated_gap <-
   df %>% filter(EventType == 'rush', RunSide == 1, RunGap != 'i') %>%
@@ -463,17 +511,20 @@ mixed_model3 <- glmer(as.numeric(UsedDesignedGap) ~ RunGap + (1|Name),
                        data = df %>% filter(EventType == 'rush', RunSide == 1, RunGap != 'i'),
                      family = 'binomial')
 
-intercepts3 <-data.frame(ranef(mixed_model3))
+intercepts3 <-data.frame(lme4::ranef(mixed_model3))
 intercepts3 <-
-  inner_join(intercepts3, player_designated_gap %>% select(Name, cluster, player_z), by = c('grp' = 'Name')) %>%
-  arrange(-condval)
+  inner_join(intercepts3, player_designated_gap %>% select(Name, cluster, player_z, DefensiveTeam), by = c('grp' = 'Name')) %>%
+  arrange(condval) %>% left_join(team_colors, by = c('DefensiveTeam' = 'team'))
 
+intercepts3$condval <- exp(mixed_model3@beta[1] + intercepts3$condval)/(1+exp(mixed_model3@beta[1] + intercepts3$condval)) - (exp(mixed_model3@beta[1])/(1+exp(mixed_model3@beta[1])))
+
+intercepts3$cluster <- factor(intercepts3$cluster, levels = c('Edge', 'Tackle', 'Nose'))
 mu <- intercepts3 %>% group_by(cluster) %>% summarise(avg_value = mean(condval))
 ggplot(intercepts3, aes(x = -condval, fill = cluster)) +
   geom_density(alpha = 0.5) +
   geom_vline(data = mu, aes(xintercept=avg_value, color = cluster)) +
   ggtitle("Mixed Effects Player Intercepts") +
-  xlab("(Negative) Player Intercept") +
+  xlab("Gap Changes Foreced Over Expectation") +
   theme(text = element_text(size=rel(3.7)), plot.title = element_text(size = 16, face = "bold"),
         axis.text=element_text(size=12), 
         legend.title=element_text(size=13), 
@@ -486,27 +537,37 @@ edge_cor <- round(cor(-edge_intercepts$condval, edge_intercepts$player_z), 3)
 tackle_cor <-round(cor(-tackle_intercepts$condval, tackle_intercepts$player_z), 3)
 nose_cor <- round(cor(-nose_intercepts$condval, nose_intercepts$player_z), 3)
 
-intercepts3$cluster <- factor(intercepts3$cluster, levels = c('Edge', 'Tackle', 'Nose'))
+intercepts3$name <- ifelse(intercepts3$condval < -.033, paste(paste0(substring(intercepts3$grp, 1, 1), '.'), paste0(sub(".*? ", "", intercepts3$grp), ','), intercepts3$DefensiveTeam), '')
+intercepts3$team_color <- ifelse(nchar(intercepts3$name) > 1 , intercepts3$color, '#000000')
+intercepts3$team_color2 <- ifelse(intercepts3$DefensiveTeam=='PIT', '#000000', intercepts3$team_color)
+
+intercepts3 <- intercepts3 %>% arrange(desc(name))
+intercepts3$name <- factor(intercepts3$name,levels=unique(intercepts3$name))
+
 intercepts3 %>%
-  ggplot(aes(x = player_z, y = -condval)) +
-  geom_point() +
-  xlim(-1.24, 3.82) + ylim(-.265, .285) +
+  ggplot(aes(x = player_z, y = -condval, label = name)) +
+  scale_color_manual(values = intercepts3$team_color2) +
+  geom_label_repel(aes(color = name), arrow = arrow(length = unit(0.02, "npc")),
+                   box.padding = .55, point.padding = .06, size = 3.28, direction = 'both', min.segment.length = .2, max.iter = 14000) +
+  new_scale_color() +
+  scale_color_manual(values = intercepts3$team_color) +
+  geom_point(aes(color = name)) +
+  xlim(-1.24, 3.82) + ylim(-.062, .068) +
   facet_wrap(~cluster, labeller = labeller(cluster = 
                                              c("Edge" = paste('Edge: Cor =', edge_cor),
                                                "Tackle" = paste('Tackle: Cor =', tackle_cor),
                                                "Nose" = paste('Nose: Cor =', nose_cor)))) +
   geom_smooth(method='lm', formula= y~x, color='blue') +
-  ylab('(Negative) Player Intercept') +
+  ylab('Gap Changes Forced Over Expectation') +
   xlab('Standardized Draft/FA Value') +
   theme(text = element_text(size=rel(3.5)), plot.title = element_text(size = 28, face = "bold"),
         axis.text=element_text(size=10.5),
-        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"))
+        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"),
+        legend.position = 'none')
 
-ggsave("intercepts3.png", width = 8.25, height = 4.6)
-
+ggsave("intercepts3.png", width = 9.2, height = 4.6)
 
 # Negative EPA Rushes
-
 neg_epa_rushes <-
   df %>% filter(EventType == 'rush', RunSide == 1, RunGap != 'i') %>%
   mutate(n=1) %>% group_by(cluster, Name, player_z) %>%
@@ -516,17 +577,21 @@ neg_epa_rushes <-
 mixed_model4 <- glmer(success ~ as.factor(Down) + ToGo + RunGap + (1|OffensiveTeam) + (1|Name),
                      data = df %>% filter(EventType == 'rush', RunSide == 1, RunGap != 'i'), family = 'binomial')
 
-intercepts4 <-data.frame(ranef(mixed_model4))[1:(nrow(data.frame(ranef(mixed_model4)))-32),]
+intercepts4 <-data.frame(lme4::ranef(mixed_model4))[1:(nrow(data.frame(lme4::ranef(mixed_model4)))-32),]
 intercepts4 <-
-  inner_join(intercepts4, neg_epa_rushes %>% select(Name, cluster, player_z), by = c('grp' = 'Name')) %>%
-  arrange(condval)
+  inner_join(intercepts4, neg_epa_rushes %>% select(Name, cluster, player_z, DefensiveTeam), by = c('grp' = 'Name')) %>%
+  arrange(condval) %>% left_join(team_colors, by = c('DefensiveTeam' = 'team'))
 
+intercepts4$condval <- exp(mixed_model4@beta[1] + intercepts4$condval)/(1+exp(mixed_model4@beta[1] + intercepts4$condval)) - (exp(mixed_model4@beta[1])/(1+exp(mixed_model4@beta[1])))
+
+intercepts4$cluster <- factor(intercepts4$cluster, levels = c('Edge', 'Tackle', 'Nose'))
 mu <- intercepts4 %>% group_by(cluster) %>% summarise(avg_value = mean(condval))
+
 ggplot(intercepts4, aes(x = -condval, fill = cluster)) +
   geom_density(alpha = 0.5) +
   geom_vline(data = mu, aes(xintercept=avg_value, color = cluster)) +
   ggtitle("Mixed Effects Player Intercepts") +
-  xlab("(Negative) Logit Player Intercept") +
+  xlab("Defensive Success Rate Over Expectation") +
   theme(text = element_text(size=rel(3.7)), plot.title = element_text(size = 16, face = "bold"),
         axis.text=element_text(size=12), 
         legend.title=element_text(size=13), 
@@ -539,22 +604,35 @@ edge_cor <- round(cor(-edge_intercepts$condval, edge_intercepts$player_z), 3)
 tackle_cor <-round(cor(-tackle_intercepts$condval, tackle_intercepts$player_z), 3)
 nose_cor <- round(cor(-nose_intercepts$condval, nose_intercepts$player_z), 3)
 
-intercepts4$cluster <- factor(intercepts4$cluster, levels = c('Edge', 'Tackle', 'Nose'))
+intercepts4$name <- ifelse(intercepts4$condval < -.0335, paste(paste0(substring(intercepts4$grp, 1, 1), '.'), paste0(sub(".*? ", "", intercepts4$grp), ','), intercepts4$DefensiveTeam), '')
+intercepts4$name <- ifelse(intercepts4$grp %in% c('Bud Dupree', 'D.J. Jones', 'Malcom Brown'), paste(paste0(substring(intercepts4$grp, 1, 1), '.'), paste0(sub(".*? ", "", intercepts4$grp), ','), intercepts4$DefensiveTeam), intercepts4$name)
+intercepts4$team_color <- ifelse(nchar(intercepts4$name) > 1 , intercepts4$color, '#000000')
+intercepts4$team_color2 <- ifelse(intercepts4$DefensiveTeam=='PIT', '#000000', intercepts4$team_color)
+
+intercepts4 <- intercepts4 %>% arrange(desc(name))
+intercepts4$name <- factor(intercepts4$name,levels=unique(intercepts4$name))
+
+
 intercepts4 %>%
-  ggplot(aes(x = player_z, y = -condval)) +
-  geom_point() +
-  xlim(-1.24, 3.82) + ylim(-.175, .22) +
+  ggplot(aes(x = player_z, y = -condval, label = name)) +
+  scale_color_manual(values = intercepts4$team_color2) +
+  geom_label_repel(aes(color = name), arrow = arrow(length = unit(0.02, "npc")),
+                   box.padding = .12, point.padding = .02, size = 3.28, direction = 'both', min.segment.length = .2, max.iter = 14000) +
+  new_scale_color() +
+  scale_color_manual(values = intercepts4$team_color) +
+  geom_point(aes(color = name)) +
+  xlim(-1.24, 3.82) + ylim(-.043, .057) +
   facet_wrap(~cluster, labeller = labeller(cluster = 
                                              c("Edge" = paste('Edge: Cor =', edge_cor),
                                                "Tackle" = paste('Tackle: Cor =', tackle_cor),
                                                "Nose" = paste('Nose: Cor =', nose_cor)))) +
   geom_smooth(method='lm', formula= y~x, color='blue') +
-  ylab('(Negative) Player Intercept') +
+  ylab('Defensive Success Rate Over Expectation') +
   xlab('Standardized Draft/FA Value') +
   theme(text = element_text(size=rel(3.5)), plot.title = element_text(size = 28, face = "bold"),
         axis.text=element_text(size=10.5),
-        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"))
+        strip.text = element_text(size = 12), panel.spacing = unit(2, "lines"),
+        legend.position = 'none')
 
-ggsave("intercepts4.png", width = 8.25, height = 4.6)
-
+ggsave("intercepts4.png", width = 9.2, height = 4.6)
 
